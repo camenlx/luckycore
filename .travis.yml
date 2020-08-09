@@ -1,0 +1,83 @@
+# errata:
+# - sudo/dist/group are set so as to get Blue Box VMs, necessary for [loopback]
+#   IPv6 support
+
+sudo: required
+dist: trusty
+
+os: linux
+language: generic
+
+addons:
+  apt:
+    packages:
+      # Use more recent docker version
+      - docker-ce
+      # Can be removed if Travis ever upgrades to Bionic
+      - realpath
+
+services:
+  - docker
+
+cache:
+  apt: true
+  ccache: true
+  directories:
+    - $HOME/cache
+
+env:
+  global:
+    # DOCKER_HUB_USER
+    - secure: "-"
+    # DOCKER_HUB_PASSWORD
+    - secure: "-"
+    - DOCKER_BUILD=false
+
+  matrix:
+    - BUILD_TARGET=arm-linux
+    - BUILD_TARGET=win32
+    - BUILD_TARGET=win64
+    - BUILD_TARGET=linux32
+    - BUILD_TARGET=linux64
+    - BUILD_TARGET=linux64_nowallet
+    #- BUILD_TARGET=linux64_release DOCKER_BUILD=true
+    - BUILD_TARGET=linux64_release
+    - BUILD_TARGET=mac
+
+before_cache:
+  # Save builder image
+  - docker save luckybit-builder-$BUILD_TARGET-$TRAVIS_JOB_NUMBER $(docker history -q luckybit-builder-$BUILD_TARGET-$TRAVIS_JOB_NUMBER | grep -v \<missing\>) | gzip -2 > $HOME/cache/docker/luckybit-builder-$BUILD_TARGET.tar.gz
+
+install:
+    # Our scripts try to be Travis agnostic
+    - export PULL_REQUEST="$TRAVIS_PULL_REQUEST"
+    - export JOB_NUMBER="$TRAVIS_JOB_NUMBER"
+    - export HOST_SRC_DIR=$TRAVIS_BUILD_DIR
+    - export HOST_CACHE_DIR=$HOME/cache
+    - source ./ci/matrix.sh
+    - mkdir -p $HOST_CACHE_DIR/docker && mkdir -p $HOST_CACHE_DIR/ccache && mkdir -p $HOST_CACHE_DIR/depends && mkdir -p $HOST_CACHE_DIR/sdk-sources
+    # Keep this as it makes caching related debugging easier
+    - ls -lah $HOST_CACHE_DIR && ls -lah $HOST_CACHE_DIR/depends && ls -lah $HOST_CACHE_DIR/ccache && ls -lah $HOST_CACHE_DIR/docker
+    # Load cached builder image
+    - if [ -f $HOST_CACHE_DIR/docker/luckybit-builder-$BUILD_TARGET.tar.gz ]; then zcat $HOST_CACHE_DIR/docker/luckybit-builder-$BUILD_TARGET.tar.gz | docker load || true; fi
+    - docker build --pull -t $BUILDER_IMAGE_NAME --build-arg=USER_ID=$UID --build-arg=GROUP_ID=$UID --build-arg=BUILD_TARGET=$BUILD_TARGET -f ci/Dockerfile.builder ci
+before_script:
+    # Make sure stdout is in blocking mode. Otherwise builds will fail due to large writes to stdout
+    # See https://github.com/travis-ci/travis-ci/issues/4704. If this gets fixed, this line can also be removed.
+    - python3 -c 'import os,sys,fcntl; flags = fcntl.fcntl(sys.stdout, fcntl.F_GETFL); fcntl.fcntl(sys.stdout, fcntl.F_SETFL, flags&~os.O_NONBLOCK);'
+script:
+    - export TRAVIS_COMMIT_LOG=`git log --format=fuller -1`
+    # Our scripts try to be Travis agnostic
+    - $DOCKER_RUN_IN_BUILDER ./ci/build_depends.sh;
+    # Gracefully stop build without running into timeouts (which won't update caches) when building depends took too long
+    # Next build should fix this situation as it will start with a populated depends cache
+    - if [ $SECONDS -gt 2400 ]; then export DEPENDS_TIMEOUT="true"; false; fi # The "false" here ensures that the build is marked as failed even though the whole script returns 0
+    - test "$DEPENDS_TIMEOUT" != "true" && $DOCKER_RUN_IN_BUILDER ./ci/build_src.sh
+    - test "$DEPENDS_TIMEOUT" != "true" && $DOCKER_RUN_IN_BUILDER ./ci/test_unittests.sh
+    - test "$DEPENDS_TIMEOUT" != "true" && $DOCKER_RUN_IN_BUILDER ./ci/test_integrationtests.sh -parallel=3
+    - test "$DEPENDS_TIMEOUT" != "true" && if [ "$DOCKER_BUILD" = "true" ]; then BUILD_DIR=build-ci/luckybitcore-$BUILD_TARGET ./docker/build-docker.sh; fi
+after_script:
+    - echo $TRAVIS_COMMIT_RANGE
+    - echo $TRAVIS_COMMIT_LOG
+after_success:
+    - if [ "$TRAVIS_PULL_REQUEST" = "false" -a "$TRAVIS_BRANCH" = "develop" -a "$DOCKER_BUILD" = "true" ]; then docker login -u $DOCKER_HUB_USER -p $DOCKER_HUB_PASSWORD && ./docker/push-docker.sh; fi
